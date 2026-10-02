@@ -22,6 +22,8 @@ class driver
 	public const LOG_FEED_ERROR = 'FPB_LOG_FEED_ERROR';
 	public const LANG_READ_MORE = 'FPB_READ_MORE';
 	public const LANG_SOURCE = 'FPB_SOURCE';
+	/** The parse_item_append event accepts the defer variable. */
+	public const SUPPORTS_ITEM_DEFER = true;
 
 	protected $config;
 	protected $config_text;
@@ -521,20 +523,32 @@ class driver
 				'author'      => $author,
 			);
 
+			$defer = false;
+
 			/**
 			 * Modify the fetched feed item before it's added to the return list
 			 *
 			 * @event ger.feedpostbot.parse_item_append
 			 * @var  object item   item as found in source
 			 * @var  array  append Array of properties to be sent to the post_message function
+			 * @var  bool   defer  Set to true to leave this item out of the current run only (default false).
+			 *                     A deferred item is not posted, marked as handled or recorded as the
+			 *                     latest item, and the backwards-compatible parse events are not triggered
+			 *                     for it. It is offered again on the next run: deferral is not a permanent skip.
 			 * @since 1.1.0
+			 * @changed 1.2.0 Added defer
 			 */
-			$vars = array('item', 'append');
+			$vars = array('item', 'append', 'defer');
 			$event_data = $this->phpbb_dispatcher->trigger_event('ger.feedpostbot.parse_item_append', compact($vars));
 			if (is_array($event_data) || $event_data instanceof \ArrayAccess)
 			{
 				extract((array) $event_data);
 			}
+			if ($defer)
+			{
+				continue;
+			}
+			$vars = array('item', 'append');
 
 			/**
 			 * Modify the fetched feed item before it's added to the return list (Backwards-compatible event)

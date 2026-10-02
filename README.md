@@ -52,6 +52,10 @@ composer install --no-dev --optimize-autoloader
    - **Append link:** Toggle appending the original article URL to the post.
 4. Set the **cron interval** (in seconds) for automated fetching, or click **Fetch all feeds manually** to test immediately.
 
+## For Extension Developers
+
+Listeners of `ger.feedpostbot.parse_item_append` can set `defer` to `true` to leave an item out of the current run, for example while data it needs is temporarily unavailable. A deferred item is not posted or marked as handled and is offered again on the next run. Check `defined('\ger\feedpostbot\classes\driver::SUPPORTS_ITEM_DEFER')` before relying on it: older versions ignore `defer` and process the item immediately.
+
 ## Support & Contributing
 
 - For questions, feature discussions, or official releases, visit the extension page on [phpBB.com](https://www.phpbb.com/customise/db/extension/feedpostbot/).
