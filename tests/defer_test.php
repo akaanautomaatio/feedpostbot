@@ -21,12 +21,16 @@ class defer_test extends \phpbb_test_case
 	protected $listeners = array();
 	/** @var array "event name:guid" of every triggered event */
 	protected $triggered = array();
+	/** @var array Feed state as stored in config_text */
+	protected $saved;
 
 	public function setUp(): void
 	{
 		parent::setUp();
 		$config = new \phpbb\config\config(array('feedpostbot_locked' => 0));
 		$config_text = $this->getMockBuilder('\phpbb\config\db_text')->disableOriginalConstructor()->getMock();
+		$config_text->method('get')->willReturnCallback(function () { return json_encode($this->saved); });
+		$config_text->method('set')->willReturnCallback(function ($key, $value) { $this->saved = json_decode($value, true); });
 		$user = $this->getMockBuilder('\phpbb\user')->disableOriginalConstructor()->getMock();
 		$user->data = array('user_id' => 2, 'username' => 'Administrator', 'user_lang' => 'en', 'is_registered' => true);
 		$user->timezone = new \DateTimeZone('UTC');
@@ -40,9 +44,10 @@ class defer_test extends \phpbb_test_case
 			return isset($this->listeners[$event]) ? call_user_func($this->listeners[$event], $data) : $data;
 		});
 		$this->driver = new defer_fixture($config, $config_text, $user, $language, $auth, $this->db, $log, './', 'php', $dispatcher);
-		$this->driver->current_state = array(array('url' => 'https://example.com/feed', 'type' => 'rss', 'user_id' => 3,
+		$this->saved = array(array('url' => 'https://example.com/feed', 'type' => 'rss', 'user_id' => 3,
 			'forum_id' => 5, 'timeout' => 3, 'textlimit' => 0, 'append_link' => 1,
 			'latest' => array('guid' => '', 'link' => '', 'pubDate' => 0), 'handled' => array()));
+		$this->driver->current_state = $this->saved;
 		// Newest first, as feeds usually are: a is the newest item, c the oldest.
 		$this->driver->xml = '<rss version="2.0"><channel><title>Feed</title>'
 			. $this->rss_item('a', 'Wed, 03 Jan 2024 10:00:00 GMT')
@@ -57,14 +62,17 @@ class defer_test extends \phpbb_test_case
 			. '</link><description>Body ' . $guid . '</description><pubDate>' . $date . '</pubDate></item>';
 	}
 
-	/** Feed bot user and target forum, loaded once per driver */
+	/** Feed bot user and target forum, loaded by every prepare_destinations() call */
 	protected function destinations()
 	{
 		$user = array('user_id' => 3, 'username' => 'Feed bot', 'user_lang' => 'en', 'user_type' => USER_NORMAL,
 			'user_timezone' => 'UTC', 'user_dateformat' => 'd/m/Y');
 		$forum = array('forum_id' => 5, 'forum_name' => 'News', 'forum_type' => FORUM_POST);
-		$this->db->expects($this->exactly(2))->method('sql_query');
-		$this->db->method('sql_fetchrow')->willReturnOnConsecutiveCalls($user, false, $forum, false);
+		$rows = array();
+		$this->db->method('sql_fetchrow')->willReturnCallback(function () use (&$rows, $user, $forum) {
+			$rows = $rows ?: array($user, false, $forum, false);
+			return array_shift($rows);
+		});
 	}
 
 	/** Defer the items with the given guids in parse_item_append */
@@ -81,6 +89,13 @@ class defer_test extends \phpbb_test_case
 	protected function run_feed()
 	{
 		return $this->driver->fetch_items($this->driver->parse_feed('https://example.com/feed', 'rss'), 0);
+	}
+
+	/** One complete cron run of the feed */
+	protected function run_all()
+	{
+		$this->driver->current_state = array();
+		return $this->driver->fetch_all();
 	}
 
 	protected function guids(array $items)
@@ -178,6 +193,58 @@ class defer_test extends \phpbb_test_case
 		$items = $this->driver->parse_feed('https://example.com/feed', 'rss');
 		$this->assertSame(array('a', 'b', 'c'), $this->guids($items));
 	}
+
+	// --- Upgrade from the former single latest marker -----------------------------------
+
+	/**
+	 * Board upgraded from a version that only kept the latest posted item: no handled history yet.
+	 * new2 and new1 appeared after the last old run; marker and the older items were posted by it.
+	 */
+	protected function legacy_marker()
+	{
+		$this->destinations();
+		unset($this->saved[0]['handled']);
+		$this->saved[0]['latest'] = array('guid' => 'marker', 'link' => 'https://example.com/marker', 'pubDate' => 0);
+		$this->driver->xml = '<rss version="2.0"><channel><title>Feed</title>';
+		foreach (array('new2' => 5, 'new1' => 4, 'marker' => 3, 'old1' => 2, 'old2' => 1) as $guid => $day)
+		{
+			$this->driver->xml .= $this->rss_item($guid, 'Fri, 0' . $day . ' Jan 2024 10:00:00 GMT');
+		}
+		$this->driver->xml .= '</channel></rss>';
+	}
+
+	public function test_legacy_marker_is_adopted_when_the_marker_item_is_deferred()
+	{
+		$this->legacy_marker();
+		$this->defer(array('marker'));
+		$this->assertSame(2, $this->run_all());
+		$this->assertSame(array('new1', 'new2'), $this->driver->posted);
+		unset($this->listeners['ger.feedpostbot.parse_item_append']);
+		$this->assertSame(0, $this->run_all());
+		$this->assertSame(array('new1', 'new2'), $this->driver->posted);
+	}
+
+	public function test_legacy_marker_adoption_covers_deferred_older_items()
+	{
+		$this->legacy_marker();
+		$this->defer(array('old1'));
+		$this->assertSame(2, $this->run_all());
+		unset($this->listeners['ger.feedpostbot.parse_item_append']);
+		$this->assertSame(0, $this->run_all());
+		$this->assertSame(array('new1', 'new2'), $this->driver->posted);
+	}
+
+	public function test_legacy_marker_adoption_keeps_deferred_new_items_retryable()
+	{
+		$this->legacy_marker();
+		$this->defer(array('new1'));
+		$this->assertSame(1, $this->run_all());
+		$this->assertSame(array('new2'), $this->driver->posted);
+		$this->assertArrayNotHasKey(hash('sha256', 'guid:new1'), $this->saved[0]['handled']);
+		unset($this->listeners['ger.feedpostbot.parse_item_append']);
+		$this->assertSame(1, $this->run_all());
+		$this->assertSame(array('new2', 'new1'), $this->driver->posted);
+	}
 }
 
 class defer_fixture extends \ger\feedpostbot\classes\driver
@@ -196,5 +263,22 @@ class defer_fixture extends \ger\feedpostbot\classes\driver
 	{
 		$this->posted[] = $item['guid'];
 		return '/post/1';
+	}
+
+	protected function create_lock()
+	{
+		return new defer_lock_fixture();
+	}
+}
+
+class defer_lock_fixture
+{
+	public function acquire()
+	{
+		return true;
+	}
+
+	public function release()
+	{
 	}
 }

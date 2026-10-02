@@ -45,6 +45,8 @@ class driver
 	protected $forum_data_cache = array();
 	protected $destinations_loaded = false;
 	protected $run_deadline = 0;
+	/** @var array|null Every item of the last parse_feed() call in feed order, deferred items included */
+	protected $feed_items;
 
 	/**
 	 * Constructor
@@ -179,7 +181,9 @@ class driver
 						$this->log_feed_error($source['url'], 'FPB_SETTINGS_INVALID');
 						continue;
 					}
-					$counter += $this->fetch_items($this->parse_feed($source['url'], $source['type'], $source['timeout']), $id);
+					$this->feed_items = null;
+					$items = $this->parse_feed($source['url'], $source['type'], $source['timeout']);
+					$counter += $this->fetch_items($items, $id, $this->feed_items);
 				}
 				catch (\Throwable $error)
 				{
@@ -456,6 +460,7 @@ class driver
 	 */
 	public function parse_feed($url, $type, $timeout = self::FEED_TIMEOUT_PARSE)
 	{
+		$this->feed_items = array();
 		$feed = $this->get_simplepie_instance($url, $timeout);
 		if (!$feed)
 		{
@@ -546,6 +551,7 @@ class driver
 			}
 			if ($defer)
 			{
+				$this->feed_items[] = $append;
 				continue;
 			}
 			$vars = array('item', 'append');
@@ -568,6 +574,7 @@ class driver
 			}
 
 			$return[] = $append;
+			$this->feed_items[] = $append;
 		}
 
 		$this->log_feed_fetched($url);
@@ -580,9 +587,11 @@ class driver
 	 *
 	 * @param array $items
 	 * @param int $source_id
+	 * @param array|null $feed_items Every item of the feed in feed order, including items deferred
+	 *                               in this run; used to adopt the former latest marker (default: $items)
 	 * @return int
 	 */
-	public function fetch_items($items, $source_id)
+	public function fetch_items($items, $source_id, $feed_items = null)
 	{
 		$posted = 0;
 		if (empty($items) || !is_array($items) || !isset($this->current_state[$source_id]))
@@ -609,8 +618,9 @@ class driver
 			{
 				$source['handled'] = array();
 				// Bootstrap the former single-marker history once, without reposting its older entries.
+				// Deferred items count as well: the marker or older entries may be deferred in this run.
 				$past_marker = false;
-				foreach ($items as $item)
+				foreach ($feed_items === null ? $items : $feed_items as $item)
 				{
 					$past_marker = $past_marker || $this->is_handled($item, $source['latest']);
 					if ($past_marker)
